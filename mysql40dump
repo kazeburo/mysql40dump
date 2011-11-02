@@ -1,0 +1,165 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use DBI;
+use Getopt::Long;
+
+sub _log {
+    my $log = ( @_ > 1 ) ? sprintf shift,@_ : $_[0];
+    my @lt = localtime;
+    my $lt = sprintf '%04d-%02d-%02dT%02d:%02d:%02d', $lt[5]+1900,$lt[4]+1,$lt[3],$lt[2],$lt[1],$lt[0];
+    print "-- [$lt] $log\n";
+    warn "[$lt] $log\n";
+}
+
+sub _wlog {
+    my $log = ( @_ > 1 ) ? sprintf shift,@_ : $_[0];
+    my @lt = localtime;
+    my $lt = sprintf '%04d-%02d-%02dT%02d:%02d:%02d', $lt[5]+1900,$lt[4]+1,$lt[3],$lt[2],$lt[1],$lt[0];
+    warn "[$lt] $log\n";
+}
+
+Getopt::Long::Configure ("no_ignore_case");
+GetOptions(
+    "master" => \my $master,
+    "slave" => \my $slave,
+    "h|help" => \my $help,
+);
+
+if ( $help ) {
+    _wlog("usage: $0 (--master|--slave) -- [database,[database]...]");
+    exit(1);
+}
+
+if ( $master && $slave ) {
+    _wlog("$0 --master and $0 --slave is exclusive");
+    exit(1);
+}
+
+if ( !$master && !$slave ) {
+    _wlog("$0 --master or $0 --slave is needed");
+    exit(1);
+}
+
+my @databases = @ARGV;
+$|=1;
+
+my @mysqldump = ('/usr/bin/mysqldump','/usr/local/bin/mysqldump','/usr/local/mysql/bin/mysqldump');
+my $mysqldump;
+for ( @mysqldump ) {
+    if ( -x $_ ) {
+        $mysqldump = $_;
+        last;
+    }
+}
+die "Died: couldnot find mysqldump" unless $mysqldump;
+
+my $dbh = DBI->connect_cached('dbi:mysql:mysql;host=localhost','root','',{
+    RaiseError => 1,
+    PrintError => 0,
+    ShowErrorStatement => 1,
+});
+
+_log("mysql40dump start");
+my ($version) = @{$dbh->selectrow_arrayref('SELECT VERSION()', {})};
+my $type = ( $version =~ m!^4! ) ? 'Type' : 'Engine';
+$dbh->do('DROP TABLE IF EXISTS tmp_backup_dummy');
+$dbh->do("CREATE TABLE tmp_backup_dummy(a INT) $type=InnoDB");
+$dbh->{'AutoCommit'} = 0;
+$dbh->do('INSERT INTO tmp_backup_dummy VALUES (?)',undef,1);
+$dbh->do('FLUSH TABLES WITH READ LOCK');
+$dbh->commit;
+_log('Done "FLUSH TABLES WITH READ LOCK"');
+
+if (!@databases) {
+    my $sth = $dbh->prepare('SHOW DATABASES');
+    $sth->execute();
+    while ( my $ret = $sth->fetchrow_arrayref ) {
+        push @databases, $ret->[0] if $ret->[0] !~ /^(?:information_schema|performance_schema|mysql|test)$/;
+    }
+}
+
+my $change_master_st;
+if ( $master ) {
+
+    my $sth = $dbh->prepare('SHOW MASTER STATUS');
+    $sth->execute;
+    my $repl_status = $sth->fetchrow_hashref('NAME');
+    
+    die "Died: couldnot get master status" unless $repl_status->{File};
+
+    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
+        $repl_status->{File},
+        $repl_status->{Position};
+}
+elsif ( $slave ) {
+    my $sth = $dbh->prepare('SHOW SLAVE STATUS');
+    $sth->execute;
+    my $repl_status = $sth->fetchrow_hashref('NAME');
+
+    die "Died: couldnot get slave status" unless $repl_status->{Relay_Master_Log_File};
+
+    $change_master_st = sprintf "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
+        $repl_status->{Master_Host},
+        $repl_status->{Master_Port},
+        $repl_status->{Master_User},
+        $repl_status->{Relay_Master_Log_File},
+        $repl_status->{Exec_master_log_pos};
+}
+
+_log("$change_master_st");
+_log("Start mysqldump --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
+print "set FOREIGN_KEY_CHECKS=0;\n" if $version =~ m!^4\.0!;
+
+pipe my $logrh, my $logwh
+    or die "Died: failed to create pipe:$!";
+
+my $pid = fork;
+if ( ! defined $pid ) {
+    die "Died: fork failed: $!";
+} 
+elsif ( $pid == 0 ) {
+    #child
+    $dbh->STORE(InactiveDestroy => 1);
+    close $logrh;
+    open STDOUT, '>&', $logwh
+        or die "Died: failed to redirect STDOUT";
+    close $logwh;
+    exec(
+        $mysqldump,
+        '--quick',
+        '--add-locks',
+        '--extended-insert',
+        '--single-transaction',
+        '--databases',
+        @databases
+    );
+    die "Died: exec failed: $!";
+}
+
+#parent
+close $logwh;
+my $unlock=0;
+while(<$logrh>){
+    print;
+    if ( $unlock == 0 && m!^CREATE DATABASE!) {
+        _wlog('Found first "CREATE DATABASE" statement. execute UNLOCK TABLES');
+        $dbh->do('UNLOCK TABLE');
+        $unlock++;
+    }
+}
+close $logrh;
+
+while (wait == -1) {}
+my $exit_code = $?;
+
+if ( $exit_code != 0 ) {
+    _log("Error: mysqldump exited with code: %d", $exit_code >> 8);
+}
+
+_log("mysql40dump ended ");
+
+exit($exit_code >> 8);
+
+
