@@ -3,7 +3,7 @@ use inc::Module::Install;
 name 'mysql40dump';
 abstract 'mysqldump wrapper for MySQL 4.0';
 author 'Masahiro Nagano';
-version '0.01';
+version '0.02';
 license 'perl';
 perl_version '5.8.5';
 

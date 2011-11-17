@@ -20,6 +20,14 @@ sub _wlog {
     warn "[$lt] $log\n";
 }
 
+sub lc_key {
+    my $hashref = shift;
+    my %hash;
+    $hash{lc($_)}=$hashref->{$_} for keys %$hashref;
+    return \%hash;
+}
+
+
 Getopt::Long::Configure ("no_ignore_case");
 GetOptions(
     "master" => \my $master,
@@ -85,27 +93,27 @@ if ( $master ) {
 
     my $sth = $dbh->prepare('SHOW MASTER STATUS');
     $sth->execute;
-    my $repl_status = $sth->fetchrow_hashref('NAME');
+    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
     
-    die "Died: couldnot get master status" unless $repl_status->{File};
+    die "Died: couldnot get master status" unless $repl_status->{file};
 
     $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
-        $repl_status->{File},
-        $repl_status->{Position};
+        $repl_status->{file},
+        $repl_status->{position};
 }
 elsif ( $slave ) {
     my $sth = $dbh->prepare('SHOW SLAVE STATUS');
     $sth->execute;
-    my $repl_status = $sth->fetchrow_hashref('NAME');
+    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
 
-    die "Died: couldnot get slave status" unless $repl_status->{Relay_Master_Log_File};
+    die "Died: couldnot get slave status" unless $repl_status->{relay_master_log_file};
 
     $change_master_st = sprintf "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
-        $repl_status->{Master_Host},
-        $repl_status->{Master_Port},
-        $repl_status->{Master_User},
-        $repl_status->{Relay_Master_Log_File},
-        $repl_status->{Exec_master_log_pos};
+        $repl_status->{master_host},
+        $repl_status->{master_port},
+        $repl_status->{master_user},
+        $repl_status->{relay_master_log_file},
+        $repl_status->{exec_master_log_pos};
 }
 
 _log("$change_master_st");
