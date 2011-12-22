@@ -160,7 +160,7 @@ elsif ( $slave ) {
 }
 
 _log("$change_master_st");
-_log("Start mysqldump --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
+_log("Start mysqldump --port $port --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
 print "set FOREIGN_KEY_CHECKS=0;\n" if $version =~ m!^4!;
 
 pipe my $logrh, my $logwh
@@ -179,6 +179,8 @@ elsif ( $pid == 0 ) {
     close $logwh;
     exec(
         $mysqldump,
+        '--port',
+        $port,
         '--quick',
         '--add-locks',
         '--extended-insert',
