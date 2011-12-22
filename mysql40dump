@@ -4,6 +4,8 @@ use strict;
 use warnings;
 use DBI;
 use Getopt::Long;
+use Sys::HostAddr qw//;
+use Net::CIDR::Lite;
 
 sub _log {
     my $log = ( @_ > 1 ) ? sprintf shift,@_ : $_[0];
@@ -32,11 +34,17 @@ Getopt::Long::Configure ("no_ignore_case");
 GetOptions(
     "master" => \my $master,
     "slave" => \my $slave,
+    "repl" => \my $repl,
+    "port=s" => \my $port,
+    "master-user=s" => \my $master_user,
+    "master-password=s" => \my $master_password,
+    "master-host=s" => \my $master_host,
+    "master-port=s" => \my $master_port,
     "h|help" => \my $help,
 );
 
 if ( $help ) {
-    _wlog("usage: $0 (--master|--slave) -- [database,[database]...]");
+    _wlog("usage: $0 (--master|--slave) (--repl) --master-user 'repl_username' --master-password 'repl_user_password' -(--master-ip ipaddr) (--master-port port) -- [database,[database]...]");
     exit(1);
 }
 
@@ -49,6 +57,17 @@ if ( !$master && !$slave ) {
     _wlog("$0 --master or $0 --slave is needed");
     exit(1);
 }
+
+if ( $master && !$master_user ) {
+    _wlog("$0 --master-user is needed with master mode");
+    exit(1);
+}
+
+if ( !$master_password ) {
+    _wlog("$0 --master-password is needed");
+    exit(1);
+}
+
 
 my @databases = @ARGV;
 $|=1;
@@ -63,7 +82,8 @@ for ( @mysqldump ) {
 }
 die "Died: couldnot find mysqldump" unless $mysqldump;
 
-my $dbh = DBI->connect_cached('dbi:mysql:mysql;host=localhost','root','',{
+$port ||= 3306;
+my $dbh = DBI->connect_cached('dbi:mysql:mysql;host=localhost;port='.$port,'root','',{
     RaiseError => 1,
     PrintError => 0,
     ShowErrorStatement => 1,
@@ -94,12 +114,34 @@ if ( $master ) {
     my $sth = $dbh->prepare('SHOW MASTER STATUS');
     $sth->execute;
     my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
-    
     die "Died: couldnot get master status" unless $repl_status->{file};
 
-    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
+    if ( !$master_port ) {
+        ($master_port) = @{$dbh->selectrow_arrayref('SELECT @@port', {})};
+    }
+    $master_port ||= 3306;
+
+    if ( !$master_host ) {
+        my $cidr = Net::CIDR::Lite->new;
+        $cidr->add_any('10.0.0.0/8');
+        $cidr->add_any('127.16.0.1/12');
+        $cidr->add_any('192.168.0.0/16');
+        my $sysaddr = Sys::HostAddr->new( ipv => 4 );
+        $master_host = $sysaddr->main_ip;
+        if ( !$master_host || !$cidr->find($master_host) ) {
+            my $ip = first { $cidr->find($_) } @{$sysaddr->addresses};
+            $master_host = $ip if $ip;
+        }
+    }
+    die "Died: couldnot get master ipaddr" unless $master_host;
+
+    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
         $repl_status->{file},
-        $repl_status->{position};
+        $repl_status->{position},
+        $master_host,
+        $master_port,
+        $master_user,
+        $master_password;
 }
 elsif ( $slave ) {
     my $sth = $dbh->prepare('SHOW SLAVE STATUS');
@@ -108,17 +150,18 @@ elsif ( $slave ) {
 
     die "Died: couldnot get slave status" unless $repl_status->{relay_master_log_file};
 
-    $change_master_st = sprintf "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s;",
-        $repl_status->{master_host},
-        $repl_status->{master_port},
-        $repl_status->{master_user},
+    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
         $repl_status->{relay_master_log_file},
-        $repl_status->{exec_master_log_pos};
+        $repl_status->{exec_master_log_pos},
+        $master_host || $repl_status->{master_host},
+        $master_port || $repl_status->{master_port},
+        $master_user || $repl_status->{master_user},
+        $master_password;
 }
 
 _log("$change_master_st");
 _log("Start mysqldump --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
-print "set FOREIGN_KEY_CHECKS=0;\n" if $version =~ m!^4\.0!;
+print "set FOREIGN_KEY_CHECKS=0;\n" if $version =~ m!^4!;
 
 pipe my $logrh, my $logwh
     or die "Died: failed to create pipe:$!";
@@ -166,6 +209,10 @@ if ( $exit_code != 0 ) {
     _log("Error: mysqldump exited with code: %d", $exit_code >> 8);
 }
 
+if ( $exit_code == 0 && $repl ) {
+    print "$change_master_st\n";
+    print "START SLAVE;\n";
+}
 _log("mysql40dump ended ");
 
 exit($exit_code >> 8);
