@@ -185,8 +185,8 @@ elsif ( $pid == 0 ) {
         '--add-locks',
         '--extended-insert',
         '--single-transaction',
-        '--databases',
         ( $version =~ m!^5! ) ? ('--order-by-primary') : (),
+        '--databases',
         @databases
     );
     die "Died: exec failed: $!";
