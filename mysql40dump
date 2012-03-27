@@ -117,7 +117,8 @@ if ( $master ) {
     die "Died: couldnot get master status" unless $repl_status->{file};
 
     if ( !$master_port ) {
-        ($master_port) = @{$dbh->selectrow_arrayref('SELECT @@port', {})};
+        my $variables = $dbh->selectrow_arrayref(q!SHOW VARIABLES LIKE 'port'!, {});
+        $master_port = $variables->[1];
     }
     $master_port ||= 3306;
 
