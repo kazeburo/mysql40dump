@@ -1,9 +1,9 @@
 use inc::Module::Install;
 
 name 'mysql40dump';
-abstract 'mysqldump wrapper for MySQL 4.0';
+abstract 'mysqldump wrapper for MySQL 4.0 and above';
 author 'Masahiro Nagano';
-version '0.05';
+version '0.06';
 license 'perl';
 perl_version '5.8.5';
 
