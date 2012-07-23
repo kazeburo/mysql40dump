@@ -29,17 +29,80 @@ sub lc_key {
     return \%hash;
 }
 
+sub get_local_ip {
+    my $cidr = Net::CIDR::Lite->new;
+    $cidr->add_any('10.0.0.0/8');
+    $cidr->add_any('127.16.0.1/12');
+    $cidr->add_any('192.168.0.0/16');
+    my $sysaddr = Sys::HostAddr->new( ipv => 4 );
+    my $main_ip = $sysaddr->main_ip;
+    if ( !$main_ip || !$cidr->find($main_ip) ) {
+        my $ip = first { $cidr->find($_) } @{$sysaddr->addresses};
+        $main_ip = $ip if $ip;
+    }
+    return $main_ip;
+}
 
+sub get_master_status {
+    my $dbh = shift;
+    my %master = @_;
+
+    my $sth = $dbh->prepare('SHOW MASTER STATUS');
+    $sth->execute;
+    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
+    die "Died: couldnot get master status" unless $repl_status->{file};
+
+    if ( !$master{port} ) {
+        my $variables = $dbh->selectrow_arrayref(q!SHOW VARIABLES LIKE 'port'!, {});
+        $master{port} = $variables->[1];
+    }
+    $master{port} ||= 3306;
+
+    $master{host} ||= get_local_ip();
+    die "Died: couldnot get own ipaddr" unless $master{host};
+
+    return sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
+        $repl_status->{file},
+        $repl_status->{position},
+        $master{host},
+        $master{port},
+        $master{user},
+        $master{password};
+}
+
+sub get_slave_status {
+    my $dbh = shift;
+    my %master = @_;
+
+    my $sth = $dbh->prepare('SHOW SLAVE STATUS');
+    $sth->execute;
+    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
+
+    return unless $repl_status->{relay_master_log_file};
+
+    return sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
+        $repl_status->{relay_master_log_file},
+        $repl_status->{exec_master_log_pos},
+        $master{host} || $repl_status->{master_host},
+        $master{port} || $repl_status->{master_port},
+        $master{user} || $repl_status->{master_user},
+        $master{password};
+}
+
+my %master;
 Getopt::Long::Configure ("no_ignore_case");
 GetOptions(
     "master" => \my $master,
     "slave" => \my $slave,
     "repl" => \my $repl,
+    "host=s" => \my $host,
     "port=s" => \my $port,
-    "master-user=s" => \my $master_user,
-    "master-password=s" => \my $master_password,
-    "master-host=s" => \my $master_host,
-    "master-port=s" => \my $master_port,
+    "user=s" => \my $user,
+    "password=s" => \my $password,
+    "master-user=s" => \$master{user},
+    "master-password=s" => \$master{password},
+    "master-host=s" => \$master{host},
+    "master-port=s" => \$master{port},
     "h|help" => \my $help,
 );
 
@@ -58,12 +121,12 @@ if ( !$master && !$slave ) {
     exit(1);
 }
 
-if ( $master && !$master_user ) {
+if ( $master && !$master{user} ) {
     _wlog("$0 --master-user is needed with master mode");
     exit(1);
 }
 
-if ( !$master_password ) {
+if ( !$master{password} ) {
     _wlog("$0 --master-password is needed");
     exit(1);
 }
@@ -82,8 +145,10 @@ for ( @mysqldump ) {
 }
 die "Died: couldnot find mysqldump" unless $mysqldump;
 
+$host ||= 'localhost';
 $port ||= 3306;
-my $dbh = DBI->connect_cached('dbi:mysql:mysql;host=localhost;port='.$port,'root','',{
+$user ||= 'root';
+my $dbh = DBI->connect_cached('dbi:mysql:mysql;host='.$host.';port='.$port, $user, $password, {
     RaiseError => 1,
     PrintError => 0,
     ShowErrorStatement => 1,
@@ -108,60 +173,28 @@ if (!@databases) {
     }
 }
 
+my $master_status = get_master_status($dbh,%master);
+my $slave_status = get_slave_status($dbh,%master);
+
 my $change_master_st;
 if ( $master ) {
-
-    my $sth = $dbh->prepare('SHOW MASTER STATUS');
-    $sth->execute;
-    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
-    die "Died: couldnot get master status" unless $repl_status->{file};
-
-    if ( !$master_port ) {
-        my $variables = $dbh->selectrow_arrayref(q!SHOW VARIABLES LIKE 'port'!, {});
-        $master_port = $variables->[1];
-    }
-    $master_port ||= 3306;
-
-    if ( !$master_host ) {
-        my $cidr = Net::CIDR::Lite->new;
-        $cidr->add_any('10.0.0.0/8');
-        $cidr->add_any('127.16.0.1/12');
-        $cidr->add_any('192.168.0.0/16');
-        my $sysaddr = Sys::HostAddr->new( ipv => 4 );
-        $master_host = $sysaddr->main_ip;
-        if ( !$master_host || !$cidr->find($master_host) ) {
-            my $ip = first { $cidr->find($_) } @{$sysaddr->addresses};
-            $master_host = $ip if $ip;
-        }
-    }
-    die "Died: couldnot get master ipaddr" unless $master_host;
-
-    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
-        $repl_status->{file},
-        $repl_status->{position},
-        $master_host,
-        $master_port,
-        $master_user,
-        $master_password;
+    die "cannot get 'MASTER STATUS'" unless $master_status;
+    $change_master_st = $master_status;
+    $slave_status = 'not configured' unless $slave_status;
 }
 elsif ( $slave ) {
-    my $sth = $dbh->prepare('SHOW SLAVE STATUS');
-    $sth->execute;
-    my $repl_status = lc_key($sth->fetchrow_hashref('NAME'));
-
-    die "Died: couldnot get slave status" unless $repl_status->{relay_master_log_file};
-
-    $change_master_st = sprintf "CHANGE MASTER TO MASTER_LOG_FILE='%s', MASTER_LOG_POS=%s, MASTER_HOST='%s', MASTER_PORT=%s, MASTER_USER='%s', MASTER_PASSWORD='%s';",
-        $repl_status->{relay_master_log_file},
-        $repl_status->{exec_master_log_pos},
-        $master_host || $repl_status->{master_host},
-        $master_port || $repl_status->{master_port},
-        $master_user || $repl_status->{master_user},
-        $master_password;
+    die "cannot get 'SLAVE STATUS'" unless $slave_status;
+    $change_master_st = $slave_status;
+    $master_status = 'not configured' unless $master_status;
 }
 
-_log("$change_master_st");
-_log("Start mysqldump --port $port --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
+my $master_mode = $master ? ' * ' : '  ';
+my $slave_mode = $slave ? ' * ' : '  ';
+
+_log("[FROM MASTER STATUS]$master_mode$master_status");
+_log("[FROM SLAVE STATUS]$slave_mode$slave_status");
+
+_log("[START] mysqldump --host $host --port $port --quick --add-locks --extended-insert --single-transaction --databases " . join(" ", @databases));
 print "set FOREIGN_KEY_CHECKS=0;\n" if $version =~ m!^4!;
 
 pipe my $logrh, my $logwh
@@ -180,6 +213,8 @@ elsif ( $pid == 0 ) {
     close $logwh;
     exec(
         $mysqldump,
+        '--host',
+        $host,
         '--port',
         $port,
         '--quick',
