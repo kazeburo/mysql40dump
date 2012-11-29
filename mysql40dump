@@ -222,6 +222,7 @@ elsif ( $pid == 0 ) {
         '--extended-insert',
         '--single-transaction',
         ( $version =~ m!^5! ) ? ('--order-by-primary') : (),
+        ( $version =~ m!^5\.(\d+)! && $1 > 0 ) ? ('--routines') : (),
         '--databases',
         @databases
     );
